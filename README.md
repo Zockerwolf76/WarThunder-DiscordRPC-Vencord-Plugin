@@ -1,0 +1,1 @@
+# WarThunder-DiscordRPC-Vencord-Plugin

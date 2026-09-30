@@ -90,6 +90,9 @@ const COUNTRY_INFO: Record<string, { name: string; flag: string; }> = {
     country_venezuela: { name: "Venezuela", flag: "https://flagcdn.com/w320/ve.png" },
 };
 
+const FLAG_CDN = "https://static.encyclopedia.warthunder.com/unit_tooltip/";
+for (const [tag, info] of Object.entries(COUNTRY_INFO)) info.flag = `${FLAG_CDN}${tag}.png`;
+
 const NAME_TO_COUNTRY: Record<string, { name: string; flag: string; }> = {};
 for (const info of Object.values(COUNTRY_INFO)) NAME_TO_COUNTRY[info.name.toLowerCase()] = info;
 Object.assign(NAME_TO_COUNTRY, {

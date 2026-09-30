@@ -156,7 +156,7 @@ function parseOperator(html: string): { name: string; flag: string; } | undefine
 
     return {
         name: prettifyCountryTag(tag),
-        flag: `https://static.encyclopedia.warthunder.com/unit_tooltip/${tag}.png`,
+        flag: `${FLAG_CDN}${tag}.png`,
     };
 }
 

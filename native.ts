@@ -1,6 +1,6 @@
 import { execFile } from "child_process";
-import { IpcMainInvokeEvent } from "electron";
-import { readFile, writeFile } from "fs/promises";
+import { app, IpcMainInvokeEvent } from "electron";
+import { readFile, unlink, writeFile } from "fs/promises";
 import { request } from "https";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -18,6 +18,9 @@ const DATAMINE_RETRY_MS = 10 * 60_000;
 
 const BR_CACHE_FILE = join(tmpdir(), "vencord-warthunderrpc-br-cache.json");
 const BR_CACHE_TTL_MS = 7 * 24 * 60 * 60_000;
+
+// Ohne User-Agent blockt Cloudflare (wiki.warthunder.com) gerne mit 403
+const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 Vencord-WarThunderRPC";
 
 const COUNTRY_INFO: Record<string, { name: string; flag: string; }> = {
     country_usa: { name: "USA", flag: "https://flagcdn.com/w320/us.png" },
@@ -145,8 +148,11 @@ function parseOperator(html: string): { name: string; flag: string; } | undefine
 
     if (!tag) return undefined;
 
+    const known = COUNTRY_INFO[tag.toLowerCase()];
+    if (known) return known;
+
     return {
-        name: COUNTRY_INFO[tag]?.name ?? prettifyCountryTag(tag),
+        name: prettifyCountryTag(tag),
         flag: `https://static.encyclopedia.warthunder.com/unit_tooltip/${tag}.png`,
     };
 }
@@ -171,7 +177,13 @@ function detectOperator(name: string, unitId: string) {
 
 function get(url: string, redirects = 0): Promise<string> {
     return new Promise<string>((resolve, reject) => {
-        const req = request(url, { method: "GET" }, res => {
+        const req = request(url, {
+            method: "GET",
+            headers: {
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/json,text/csv,*/*",
+            },
+        }, res => {
             const code = res.statusCode ?? 0;
 
             if (code >= 300 && code < 400 && res.headers.location && redirects < MAX_REDIRECTS) {
@@ -299,13 +311,22 @@ async function ensureBattleRatings() {
 }
 
 
+
+
 const NAMES_URL = "https://raw.githubusercontent.com/gszabi99/War-Thunder-Datamine/master/lang.vromfs.bin_u/lang/units.csv";
-const NAMES_CACHE_FILE = join(tmpdir(), "vencord-warthunderrpc-names-cache-v2.json");
+const NAMES_CACHE_FILE = join(tmpdir(), "vencord-warthunderrpc-names-cache-v3.json");
 const NAMES_CACHE_TTL_MS = 7 * 24 * 60 * 60_000;
 
+// Anzeigename (Killfeed, EN + DE) -> Unit-ID
 let idByName: Map<string, string> | null = null;
+// Unit-ID -> englischer Anzeigename (Fallback, wenn das Wiki nicht erreichbar ist)
+let nameById: Map<string, string> | null = null;
 let namesPromise: Promise<void> | null = null;
 let namesFailedAt = 0;
+
+function unquoteCsv(field: string | undefined) {
+    return (field ?? "").replace(/^"|"$/g, "").replace(/""/g, "\"").trim();
+}
 
 async function ensureUnitNames() {
     if (idByName) return;
@@ -315,21 +336,25 @@ async function ensureUnitNames() {
         try {
             try {
                 const cached = JSON.parse(await readFile(NAMES_CACHE_FILE, "utf8"));
-                if (cached?.savedAt && Date.now() - cached.savedAt < NAMES_CACHE_TTL_MS && cached.data) {
-                    idByName = new Map(Object.entries<string>(cached.data));
+                if (cached?.savedAt && Date.now() - cached.savedAt < NAMES_CACHE_TTL_MS && cached.byName && cached.byId) {
+                    idByName = new Map(Object.entries<string>(cached.byName));
+                    nameById = new Map(Object.entries<string>(cached.byId));
                     return;
                 }
             } catch {
             }
 
             const csv = await get(NAMES_URL);
-            const data: Record<string, string> = {};
+            const byName: Record<string, string> = {};
+            const byId: Record<string, string> = {};
+            const byIdIsShop: Record<string, boolean> = {};
 
-            for (const line of csv.split("\n")) {
-                if (!line.startsWith('"') || line.includes('"<ID')) continue;
+            for (const rawLine of csv.split("\n")) {
+                const line = rawLine.replace(/\r$/, "");
+                if (!line.startsWith("\"") || line.includes("\"<ID")) continue;
 
-                const fields = line.replace(/^"/, "").split('";"');
-                const key = fields[0];
+                const fields = line.split("\";\"");
+                const key = unquoteCsv(fields[0]);
                 if (!key || key.includes("/")) continue;
 
                 let unitId: string | undefined;
@@ -338,15 +363,22 @@ async function ensureUnitNames() {
                 else if (key.endsWith("_0") || key.endsWith("_1") || key.endsWith("_2")) unitId = key.slice(0, -2);
                 if (!unitId) continue;
 
+                const english = unquoteCsv(fields[1]);
+                if (english && (priority || !byId[unitId]) && !byIdIsShop[unitId]) {
+                    byId[unitId] = english;
+                    if (priority) byIdIsShop[unitId] = true;
+                }
+
                 for (const name of [fields[1], fields[4]]) {
-                    const clean = name?.trim().toLowerCase();
+                    const clean = unquoteCsv(name).toLowerCase();
                     if (!clean) continue;
-                    if (priority || !data[clean]) data[clean] = unitId;
+                    if (priority || !byName[clean]) byName[clean] = unitId;
                 }
             }
 
-            idByName = new Map(Object.entries(data));
-            writeFile(NAMES_CACHE_FILE, JSON.stringify({ savedAt: Date.now(), data })).catch(() => {});
+            idByName = new Map(Object.entries(byName));
+            nameById = new Map(Object.entries(byId));
+            writeFile(NAMES_CACHE_FILE, JSON.stringify({ savedAt: Date.now(), byName, byId })).catch(() => {});
         } catch {
             namesFailedAt = Date.now();
         } finally {
@@ -365,6 +397,20 @@ export async function resolveUnitIdByName(_: IpcMainInvokeEvent, displayName: st
 }
 
 
+const NAMED_ENTITIES: Record<string, string> = {
+    amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: " ", ndash: "–", mdash: "—",
+};
+
+function decodeEntities(s: string) {
+    return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e: string) => {
+        if (e[0] === "#") {
+            const code = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+            return Number.isFinite(code) && code >= 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : m;
+        }
+        return NAMED_ENTITIES[e.toLowerCase()] ?? m;
+    });
+}
+
 function titleToVehicleName(title: string) {
     return title
         .replace(/\s*\|\s*War Thunder Wiki\s*$/i, "")
@@ -374,8 +420,8 @@ function titleToVehicleName(title: string) {
 }
 
 function parseName(html: string) {
-    const match = html.match(/<title[^>]*>(.*?)<\/title>/i);
-    return titleToVehicleName((match?.[1] ?? "").trim());
+    const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    return titleToVehicleName(decodeEntities((match?.[1] ?? "").replace(/\s+/g, " ").trim()));
 }
 
 function parseMetaContent(html: string, property: string): string | undefined {
@@ -384,12 +430,16 @@ function parseMetaContent(html: string, property: string): string | undefined {
 
     for (const tag of tags) {
         if (!propRe.test(tag)) continue;
-        const content = tag.match(/content\s*=\s*["']([^"']+)["']/i);
-        const url = content?.[1]?.trim();
-        if (url) return url;
+        const content = tag.match(/content\s*=\s*(?:"([^"]+)"|'([^']+)')/i);
+        const value = (content?.[1] ?? content?.[2])?.trim();
+        if (value) return decodeEntities(value);
     }
 
     return undefined;
+}
+
+function parseRenderImage(html: string): string | undefined {
+    return html.match(/https:\/\/static\.encyclopedia\.warthunder\.com\/images\/[^"'\s<>)]+\.png/i)?.[0];
 }
 
 export interface VehicleInfo {
@@ -400,6 +450,10 @@ export interface VehicleInfo {
     nation?: string;
     type?: string;
     br?: BattleRatings;
+    /** og:image des Wikis (Vorschaukarte der ganzen Seite) — nur fürs Profil-Widget */
+    socialImage?: string;
+    /** true = Wiki war nicht erreichbar, Daten stammen nur aus dem Datamine -> später erneut versuchen */
+    partial?: boolean;
 }
 
 export async function resolveVehicleInfo(_: IpcMainInvokeEvent, vehicleId: string): Promise<VehicleInfo> {
@@ -407,56 +461,110 @@ export async function resolveVehicleInfo(_: IpcMainInvokeEvent, vehicleId: strin
     if (!id) return { name: UNKNOWN, images: [], wikiUrl: "" };
 
     const wikiUrl = `${WIKI_BASE}${encodeURIComponent(id)}`;
-    const encyclopediaImage = `${ENCYCLOPEDIA_IMG}${encodeURIComponent(id)}.png`;
+    // Die Render-Dateien sind komplett kleingeschrieben, Unit-IDs aus dem Spiel teils nicht
+    const encyclopediaImage = `${ENCYCLOPEDIA_IMG}${encodeURIComponent(id.toLowerCase())}.png`;
 
-    const [, , htmlResult] = await Promise.allSettled([
+    const [, , , htmlResult] = await Promise.allSettled([
         ensureUnitMeta(),
         ensureBattleRatings(),
+        ensureUnitNames(),
         get(wikiUrl),
     ]);
 
     const meta = metaByUnit?.get(id);
     const treeCountry = meta?.country ? COUNTRY_INFO[meta.country] : undefined;
     const br = brByUnit?.get(id);
+    const csvName = nameById?.get(id);
 
     if (htmlResult.status === "fulfilled") {
         const html = htmlResult.value;
         const ogImage = parseMetaContent(html, "og:image");
-        const name = parseName(html) || UNKNOWN;
+        const name = parseName(html) || csvName || UNKNOWN;
 
         const country = parseOperator(html) ?? detectOperator(name, id) ?? treeCountry;
 
-        const images = [encyclopediaImage];
-        if (ogImage && /^https?:\/\//i.test(ogImage)) images.push(ogImage);
+        // Fahrzeug-Render direkt aus der Seite; og:image ist nur die Social-Vorschaukarte
+        // der ganzen Wiki-Seite und taugt nicht als Presence-Bild.
+        const images = [...new Set([parseRenderImage(html), encyclopediaImage].filter(Boolean) as string[])];
+        const socialImage = ogImage && /^https?:\/\//i.test(ogImage) ? ogImage : undefined;
 
-        return { name, images, wikiUrl, flag: country?.flag, nation: country?.name, type: meta?.type, br };
+        return { name, images, socialImage, wikiUrl, flag: country?.flag, nation: country?.name, type: meta?.type, br };
     }
 
-    const country = detectOperator("", id) ?? treeCountry;
-    return { name: UNKNOWN, images: [encyclopediaImage], wikiUrl, flag: country?.flag, nation: country?.name, type: meta?.type, br };
+    // Wiki nicht erreichbar: trotzdem alles zeigen, was das Datamine hergibt
+    const name = csvName || ((meta || br) ? id : UNKNOWN);
+    const country = detectOperator(name, id) ?? treeCountry;
+    return {
+        name,
+        images: [encyclopediaImage],
+        wikiUrl,
+        flag: country?.flag,
+        nation: country?.name,
+        type: meta?.type,
+        br,
+        partial: true,
+    };
 }
 
 export async function isWarThunderRunning(_: IpcMainInvokeEvent) {
     return new Promise<boolean>(resolve => {
-        execFile("tasklist", ["/FO", "CSV", "/NH"], { windowsHide: true }, (err, stdout) => {
-            if (err) {
-                resolve(false);
-                return;
-            }
+        if (process.platform === "win32") {
+            execFile("tasklist", ["/FO", "CSV", "/NH"], { windowsHide: true }, (err, stdout) => {
+                if (err) {
+                    resolve(false);
+                    return;
+                }
 
-            const list = String(stdout || "").toLowerCase();
-            resolve(list.includes("\"aces.exe\"") || list.includes("\"aces64.exe\""));
-        });
+                const list = String(stdout || "").toLowerCase();
+                resolve(list.includes("\"aces.exe\"") || list.includes("\"aces64.exe\""));
+            });
+            return;
+        }
+
+        // Linux / macOS: pgrep liefert Exit-Code 0, wenn ein Prozess gefunden wurde
+        execFile("pgrep", ["-x", "aces"], err => resolve(!err));
     });
+}
+
+
+// Bot-Token liegt in einer eigenen Datei statt in settings.json,
+// damit er nicht in Settings-Exporten oder im Cloud-Sync landet.
+function tokenFile() {
+    return join(app.getPath("userData"), "warthunderrpc-widget-token.txt");
+}
+
+async function readToken() {
+    try {
+        return (await readFile(tokenFile(), "utf8")).trim();
+    } catch {
+        return "";
+    }
+}
+
+export async function setWidgetToken(_: IpcMainInvokeEvent, token: string): Promise<boolean> {
+    const clean = String(token ?? "").trim();
+    try {
+        if (clean) await writeFile(tokenFile(), clean, { encoding: "utf8", mode: 0o600 });
+        else await unlink(tokenFile()).catch(() => {});
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export async function hasWidgetToken(_: IpcMainInvokeEvent): Promise<boolean> {
+    return Boolean(await readToken());
 }
 
 export async function pushWidgetProfile(
     _: IpcMainInvokeEvent,
     appId: string,
     userId: string,
-    botToken: string,
     bodyJson: string,
 ): Promise<{ ok: boolean; status?: number; error?: string; }> {
+    const botToken = await readToken();
+    if (!botToken) return { ok: false, error: "no token" };
+
     return new Promise(resolve => {
         const url = `https://discord.com/api/v9/applications/${encodeURIComponent(appId)}/users/${encodeURIComponent(userId)}/identities/0/profile`;
 

@@ -6,7 +6,7 @@ import { ApplicationAssetUtils, FluxDispatcher, React, UserStore } from "@webpac
 const APP_ID = "1480182808507973812";
 const API_BASE = "http://127.0.0.1:8111";
 const UNKNOWN = "Unknown Vehicle";
-const LARGE_FALLBACK = "mp:https://warthunder.com/i/opengraph-wt.jpg";
+const LARGE_FALLBACK_URL = "https://warthunder.com/i/opengraph-wt.jpg";
 const LOGO_KEYS = ["warthunderlogo", "warthunder", "logo", "main", "icon"];
 
 const PROCESS_CHECK_MS = 10_000;
@@ -14,9 +14,11 @@ const FAILED_RETRY_MS = 5 * 60_000;
 const FETCH_TIMEOUT_MS = 1500;
 
 const KILL_VERBS = ["destroyed", "shot down", "abgeschossen", "zerstört"];
-const CRASH_HINTS = ["crashed", "abgestürzt"];
+const CRASH_HINTS = ["crashed", "wrecked", "abgestürzt"];
 
 const logger = new Logger("WarThunderRPC");
+
+const Native = VencordNative.pluginHelpers.WarThunderRPC as PluginNative<typeof import("./native")>;
 
 const sectionHeader = (title: string) => ({
     type: OptionType.COMPONENT,
@@ -32,6 +34,60 @@ const sectionHeader = (title: string) => ({
         },
     }, title),
 } as any);
+
+/** Token-Eingabe: der Token geht direkt in eine Datei im Discord-Datenordner, nie in settings.json. */
+function TokenSetting() {
+    const [value, setValue] = React.useState("");
+    const [status, setStatus] = React.useState("…");
+
+    const refresh = () => Native.hasWidgetToken()
+        .then(has => setStatus(has ? "✅ Token gespeichert" : "Kein Token gespeichert"))
+        .catch(() => setStatus("Status unbekannt"));
+
+    React.useEffect(() => { refresh(); }, []);
+
+    const save = async (token: string) => {
+        const ok = await Native.setWidgetToken(token);
+        setValue("");
+        if (!ok) setStatus("❌ Speichern fehlgeschlagen");
+        else refresh();
+    };
+
+    const inputStyle = {
+        flex: 1,
+        padding: "8px 10px",
+        borderRadius: "4px",
+        border: "1px solid var(--background-modifier-accent)",
+        background: "var(--input-background, var(--background-secondary))",
+        color: "var(--text-normal)",
+    };
+    const buttonStyle = {
+        padding: "8px 14px",
+        borderRadius: "4px",
+        border: "none",
+        cursor: "pointer",
+        background: "var(--brand-500, #5865f2)",
+        color: "white",
+    };
+
+    return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: "6px" } },
+        React.createElement("div", { style: { color: "var(--header-secondary)", fontSize: "14px" } },
+            "Bot token of your application — stored in a separate local file, not in your Vencord settings/backups"),
+        React.createElement("div", { style: { display: "flex", gap: "8px" } },
+            React.createElement("input", {
+                type: "password",
+                placeholder: "Paste token…",
+                value,
+                autoComplete: "off",
+                onChange: (e: any) => setValue(e.currentTarget.value),
+                style: inputStyle,
+            }),
+            React.createElement("button", { style: buttonStyle, onClick: () => value.trim() && save(value) }, "Save"),
+            React.createElement("button", { style: { ...buttonStyle, background: "var(--button-danger-background, #da373c)" }, onClick: () => save("") }, "Clear"),
+        ),
+        React.createElement("div", { style: { color: "var(--text-muted)", fontSize: "12px" } }, status),
+    );
+}
 
 const settings = definePluginSettings({
     secPresence: sectionHeader("🎮 Presence"),
@@ -136,10 +192,17 @@ const settings = definePluginSettings({
         description: "Push live stats to your profile widget",
         default: false,
     },
+    widgetToken: {
+        type: OptionType.COMPONENT,
+        description: "",
+        component: TokenSetting,
+    } as any,
+    // Alt: Token lag früher hier im Klartext. Wird beim Start in die Token-Datei migriert und geleert.
     widgetBotToken: {
         type: OptionType.STRING,
-        description: "Bot token of your application (treat like a password!)",
+        description: "Legacy — migrated automatically, leave empty",
         default: "",
+        hidden: true,
     },
 
     secAdvanced: sectionHeader("⚙️ Advanced"),
@@ -152,8 +215,6 @@ const settings = definePluginSettings({
     },
 });
 
-const Native = VencordNative.pluginHelpers.WarThunderRPC as PluginNative<typeof import("./native")>;
-
 interface VehicleInfo {
     id: string;
     name: string;
@@ -163,19 +224,26 @@ interface VehicleInfo {
     nation?: string;
     type?: string;
     br?: { ab: string; rb: string; sb: string; };
+    socialImage?: string;
+    partial?: boolean;
 }
 
 const LABELS = {
-    en: { inMatch: "In Match", inHangar: "In Hangar", offline: "Offline", lastMatch: "Last match:", session: "Session:", using: "Using:" },
-    de: { inMatch: "Im Gefecht", inHangar: "Im Hangar", offline: "Offline", lastMatch: "Letztes Match:", session: "Sitzung:", using: "Unterwegs mit:" },
+    en: { inMatch: "In Match", inHangar: "In Hangar", offline: "Offline", lastMatch: "Last match:", session: "Session:", using: "Using:", wiki: "Vehicle Wiki", locale: "en-US" },
+    de: { inMatch: "Im Gefecht", inHangar: "Im Hangar", offline: "Offline", lastMatch: "Letztes Match:", session: "Sitzung:", using: "Unterwegs mit:", wiki: "Fahrzeug-Wiki", locale: "de-DE" },
 } as const;
 
 function labels() {
     return LABELS[settings.store.language as keyof typeof LABELS] ?? LABELS.en;
 }
 
-let timer: NodeJS.Timeout | null = null;
-let stopped = true;
+function playerName() {
+    return settings.store.playerName?.trim() ?? "";
+}
+
+let timer: ReturnType<typeof setTimeout> | null = null;
+/** Wird bei jedem start()/stop() erhöht — ein Tick aus einem alten Lauf darf danach nichts mehr senden. */
+let runId = 0;
 
 let wasRunning = false;
 let wasInMatch = false;
@@ -185,18 +253,22 @@ let lastProcessCheck = 0;
 let lastActivityJson = "";
 let lastEmptyTypeLog = 0;
 
+/** Erhöht sich bei jedem Match-Start, damit verspätete Namens-Lookups kein altes Schiff eintragen. */
+let matchId = 0;
 let navalUnitId = "";
 let navalDetectedName = "";
 
 let kills = 0;
 let deaths = 0;
 let lastDmgId = 0;
+/** Für welchen Spielernamen die Killfeed-Baseline gesetzt wurde ("" = noch keine). */
+let killFeedBaselineFor = "";
 let lastMatch: { kills: number; deaths: number; } | null = null;
 let sessionKills = 0;
 let sessionDeaths = 0;
 
-const vehicleCache = new Map<string, VehicleInfo>();
-const failedLookups = new Map<string, number>();
+const vehicleCache = new Map<string, { info: VehicleInfo | null; at: number; }>();
+const pendingLookups = new Set<string>();
 const assetCache = new Map<string, string>();
 const failedAssets = new Map<string, number>();
 
@@ -258,18 +330,17 @@ async function getLogoAsset() {
         const id = await getAsset(key);
         if (id) return id;
     }
-    return undefined;
+    // Fallback über Discords Media-Proxy statt eines ungültigen "mp:https://…"
+    return getAsset(LARGE_FALLBACK_URL);
 }
-
 
 function styledImageCandidates(vehicle: VehicleInfo): string[] {
     if (settings.store.imageStyle !== "contain") return vehicle.images;
 
-    const padded = vehicle.images.map(url =>
-        `https://wsrv.nl/?url=${encodeURIComponent(url)}&w=512&h=512&fit=contain&output=png`
-    );
-
-    return [...padded, ...vehicle.images];
+    return vehicle.images.flatMap(url => [
+        `https://wsrv.nl/?url=${encodeURIComponent(url)}&w=512&h=512&fit=contain&output=png`,
+        url,
+    ]);
 }
 
 async function getVehicleImageAsset(vehicle: VehicleInfo): Promise<string | undefined> {
@@ -280,43 +351,47 @@ async function getVehicleImageAsset(vehicle: VehicleInfo): Promise<string | unde
     return undefined;
 }
 
-async function resolveVehicle(rawType: string): Promise<VehicleInfo | null> {
-    const unitId = unitIdFromType(rawType);
+/**
+ * Nicht-blockierend: gibt sofort zurück, was im Cache liegt, und startet den Lookup im Hintergrund.
+ * So hängt der Tick nie auf Wiki-/Datamine-Downloads.
+ */
+function resolveVehicle(unitId: string): VehicleInfo | null {
     if (!unitId) return null;
 
-    const cached = vehicleCache.get(unitId);
-    if (cached) return cached;
+    const entry = vehicleCache.get(unitId);
+    const needsLookup = !entry
+        || ((entry.info === null || entry.info.partial) && Date.now() - entry.at >= FAILED_RETRY_MS);
 
-    const failedAt = failedLookups.get(unitId);
-    if (failedAt && Date.now() - failedAt < FAILED_RETRY_MS) return null;
+    if (needsLookup && !pendingLookups.has(unitId)) {
+        pendingLookups.add(unitId);
 
-    try {
-        const raw = await Native.resolveVehicleInfo(unitId);
-        logger.info(`Resolved "${unitId}" ->`, raw);
-
-        if (raw?.name && raw.name !== UNKNOWN) {
-            const info: VehicleInfo = { id: unitId, ...raw };
-            vehicleCache.set(unitId, info);
-            failedLookups.delete(unitId);
-            return info;
-        }
-    } catch (e) {
-        logger.warn(`resolveVehicleInfo failed for "${unitId}"`, e);
+        Native.resolveVehicleInfo(unitId)
+            .then(raw => {
+                logger.info(`Resolved "${unitId}" ->`, raw);
+                const info: VehicleInfo | null = raw?.name && raw.name !== UNKNOWN ? { id: unitId, ...raw } : null;
+                // Ein brauchbares Teilergebnis nicht durch einen Fehlschlag ersetzen
+                vehicleCache.set(unitId, { info: info ?? entry?.info ?? null, at: Date.now() });
+            })
+            .catch(e => {
+                logger.warn(`resolveVehicleInfo failed for "${unitId}"`, e);
+                vehicleCache.set(unitId, { info: entry?.info ?? null, at: Date.now() });
+            })
+            .finally(() => pendingLookups.delete(unitId));
     }
 
-    failedLookups.set(unitId, Date.now());
-    return null;
+    return entry?.info ?? null;
 }
 
 function telemetryLine(state: any, indicators: any): string | null {
     const parts: string[] = [];
+    const { locale } = labels();
 
     if (state?.valid) {
         const speed = state["TAS, km/h"] ?? state["IAS, km/h"];
         const alt = state["H, m"];
 
         if (typeof speed === "number" && speed > 0) parts.push(`${Math.round(speed)} km/h`);
-        if (typeof alt === "number" && alt > 0) parts.push(`${Math.round(alt).toLocaleString("de-DE")} m`);
+        if (typeof alt === "number" && alt > 0) parts.push(`${Math.round(alt).toLocaleString(locale)} m`);
     } else if (typeof indicators?.speed === "number" && indicators.speed > 0) {
         parts.push(`${Math.round(indicators.speed)} km/h`);
     }
@@ -354,26 +429,41 @@ function classifyDamage(rawMsg: string, me: string) {
         else deaths++;
     }
 }
-async function baselineKillFeed() {
-    lastDmgId = 0;
+
+async function baselineKillFeed(): Promise<boolean> {
     const hud = await readJson("hudmsg?lastEvt=0&lastDmg=0");
-    for (const entry of hud?.damage ?? []) {
+    if (!hud) return false;
+
+    lastDmgId = 0;
+    for (const entry of hud.damage ?? []) {
         if (typeof entry.id === "number") lastDmgId = Math.max(lastDmgId, entry.id);
     }
+    return true;
 }
 
 async function updateKillFeed() {
-    const me = settings.store.playerName?.trim();
-    if (!me || !settings.store.showKills) return;
+    const me = playerName();
+    if (!me) return;
+
+    // Baseline beim Match-Start, oder wenn Name/Tracking mitten im Match eingeschaltet wurde:
+    // alte Killfeed-Einträge nicht nachträglich zählen.
+    if (killFeedBaselineFor !== me) {
+        if (await baselineKillFeed()) killFeedBaselineFor = me;
+        return;
+    }
 
     const hud = await readJson(`hudmsg?lastEvt=0&lastDmg=${lastDmgId}`);
-    let ownVehicleName = "";
-    const ownVehicleRe = new RegExp(escapeRegExp(me) + "\\s*\\(((?:[^()]|\\([^()]*\\))+)\\)");
+    if (!hud) return;
 
-    for (const entry of hud?.damage ?? []) {
+    const countKills = settings.store.showKills;
+    const ownVehicleRe = new RegExp(`(?:^|[^\\w-])${escapeRegExp(me)}\\s*\\(((?:[^()]|\\([^()]*\\))+)\\)`);
+    let ownVehicleName = "";
+
+    for (const entry of hud.damage ?? []) {
         if (typeof entry.id === "number") lastDmgId = Math.max(lastDmgId, entry.id);
         const msg = String(entry.msg ?? "");
-        classifyDamage(msg, me);
+
+        if (countKills) classifyDamage(msg, me);
 
         const own = ownVehicleRe.exec(msg);
         if (own?.[1]) ownVehicleName = own[1].trim();
@@ -381,23 +471,49 @@ async function updateKillFeed() {
 
     if (ownVehicleName && ownVehicleName !== navalDetectedName) {
         navalDetectedName = ownVehicleName;
-        try {
-            const id = await Native.resolveUnitIdByName(ownVehicleName);
-            if (id) {
-                navalUnitId = id;
-                logger.info(`Eigenes Fahrzeug aus Killfeed: "${ownVehicleName}" -> ${id}`);
-            } else {
-                logger.warn(`Killfeed-Name nicht in Namens-Tabelle: "${ownVehicleName}"`);
-            }
-        } catch {
-        }
+        const forMatch = matchId;
+
+        Native.resolveUnitIdByName(ownVehicleName)
+            .then(id => {
+                if (forMatch !== matchId) return;
+                if (id) {
+                    navalUnitId = id;
+                    logger.info(`Eigenes Fahrzeug aus Killfeed: "${ownVehicleName}" -> ${id}`);
+                } else {
+                    logger.warn(`Killfeed-Name nicht in Namens-Tabelle: "${ownVehicleName}"`);
+                }
+            })
+            .catch(() => { });
     }
+}
+
+function startMatch() {
+    matchId++;
+    matchStart = Date.now();
+    kills = 0;
+    deaths = 0;
+    killFeedBaselineFor = "";
+    navalUnitId = "";
+    navalDetectedName = "";
+}
+
+function finishMatch() {
+    lastMatch = { kills, deaths };
+    sessionKills += kills;
+    sessionDeaths += deaths;
+    kills = 0;
+    deaths = 0;
+    navalUnitId = "";
+    navalDetectedName = "";
 }
 
 
 const WIDGET_MIN_INTERVAL_MS = 15_000;
 let lastWidgetPush = 0;
 let lastWidgetJson = "";
+let lastWidgetStatus = "";
+/** true, solange auf dem Profil ein anderer Status als "Offline" steht */
+let widgetOnline = false;
 
 function brForMode(vehicle: VehicleInfo | null): string | undefined {
     const mode = settings.store.brMode;
@@ -405,93 +521,105 @@ function brForMode(vehicle: VehicleInfo | null): string | undefined {
     return vehicle.br[mode as "ab" | "rb" | "sb"];
 }
 
-async function pushWidget(vehicle: VehicleInfo | null, status: string, force = false) {
-    if (!settings.store.widgetEnabled) return;
+function kdString(k: number, d: number) {
+    return d > 0 ? (k / d).toFixed(2) : String(k);
+}
 
-    const token = settings.store.widgetBotToken?.trim();
-    if (!token) return;
+async function pushWidget(vehicle: VehicleInfo | null, status: string, inMatch: boolean, opts: { force?: boolean; offline?: boolean; } = {}) {
+    // Offline-Push läuft auch, wenn der Widget gerade deaktiviert wurde — sonst bleibt der alte Status stehen
+    if (opts.offline) {
+        if (!widgetOnline) return;
+    } else if (!settings.store.widgetEnabled) {
+        return;
+    }
 
     const me = UserStore.getCurrentUser();
     if (!me?.id) return;
 
-    const appId = APP_ID;
-    const kd = sessionDeaths > 0 ? (sessionKills / sessionDeaths).toFixed(2) : String(sessionKills);
-    const matchKd = deaths > 0 ? (kills / deaths).toFixed(2) : String(kills);
+    const match = inMatch ? { kills, deaths } : (lastMatch ?? { kills: 0, deaths: 0 });
+    const liveSessionKills = sessionKills + (inMatch ? kills : 0);
+    const liveSessionDeaths = sessionDeaths + (inMatch ? deaths : 0);
+    const sessionKd = kdString(liveSessionKills, liveSessionDeaths);
+    const matchKd = kdString(match.kills, match.deaths);
+    const br = brForMode(vehicle);
 
+    // "kills"/"deaths"/"kd" bleiben als Aliase erhalten, damit bestehende Widget-Layouts weiter funktionieren
     const dynamic: any[] = [
         { type: 1, name: "status", value: status },
         { type: 1, name: "vehicle", value: vehicle?.name ?? "—" },
         { type: 1, name: "nation", value: vehicle?.nation ?? "—" },
         { type: 1, name: "vehicle_type", value: vehicle?.type ?? "—" },
-        { type: 1, name: "br", value: brForMode(vehicle) ?? "—" },
-        { type: 2, name: "kills", value: kills },
-        { type: 2, name: "deaths", value: deaths },
-        { type: 2, name: "match_kills", value: kills },
-        { type: 2, name: "match_deaths", value: deaths },
-        { type: 2, name: "session_kills", value: sessionKills },
-        { type: 2, name: "session_deaths", value: sessionDeaths },
-        { type: 1, name: "kd", value: kd },
-        { type: 1, name: "session_kd", value: kd },
+        { type: 1, name: "br", value: br ?? "—" },
+        { type: 2, name: "kills", value: match.kills },
+        { type: 2, name: "deaths", value: match.deaths },
+        { type: 2, name: "match_kills", value: match.kills },
+        { type: 2, name: "match_deaths", value: match.deaths },
+        { type: 2, name: "session_kills", value: liveSessionKills },
+        { type: 2, name: "session_deaths", value: liveSessionDeaths },
+        { type: 1, name: "kd", value: sessionKd },
+        { type: 1, name: "session_kd", value: sessionKd },
         { type: 1, name: "match_kd", value: matchKd },
-        { type: 1, name: "br_line", value: [brForMode(vehicle) && `BR ${brForMode(vehicle)}`, vehicle?.nation].filter(Boolean).join(" · ") || "—" },
-        { type: 1, name: "stats_line", value: `⚔ ${sessionKills} ☠ ${sessionDeaths} · K/D ${kd}` },
+        { type: 1, name: "br_line", value: [br && `BR ${br}`, vehicle?.nation].filter(Boolean).join(" · ") || "—" },
+        { type: 1, name: "stats_line", value: `⚔ ${liveSessionKills} ☠ ${liveSessionDeaths} · K/D ${sessionKd}` },
     ];
 
     if (vehicle?.images[0]) dynamic.push({ type: 3, name: "vehicle_image", value: { url: vehicle.images[0] } });
-    if (vehicle?.images[1]) dynamic.push({ type: 3, name: "vehicle_art", value: { url: vehicle.images[1] } });
+    const art = vehicle?.socialImage ?? vehicle?.images[1];
+    if (art) dynamic.push({ type: 3, name: "vehicle_art", value: { url: art } });
     if (vehicle?.flag) dynamic.push({ type: 3, name: "flag_image", value: { url: vehicle.flag } });
 
     const json = JSON.stringify({ username: me.username, data: { dynamic } });
 
     const now = Date.now();
-    if (!force && (json === lastWidgetJson || now - lastWidgetPush < WIDGET_MIN_INTERVAL_MS)) return;
+    // Statuswechsel (Match <-> Hangar <-> Offline) sofort pushen, sonst max. alle 15 s
+    const force = opts.force || opts.offline || status !== lastWidgetStatus;
+    if (json === lastWidgetJson) return;
+    if (!force && now - lastWidgetPush < WIDGET_MIN_INTERVAL_MS) return;
+
     lastWidgetPush = now;
     lastWidgetJson = json;
+    lastWidgetStatus = status;
 
     try {
-        const res = await Native.pushWidgetProfile(appId, me.id, token, json);
-        if (!res.ok) logger.warn("Widget push failed", res);
+        const res = await Native.pushWidgetProfile(APP_ID, me.id, json);
+        if (!res.ok) {
+            if (res.error !== "no token") logger.warn("Widget push failed", res);
+            lastWidgetJson = ""; // beim nächsten Tick erneut versuchen
+            return;
+        }
+        widgetOnline = !opts.offline;
     } catch (e) {
         logger.warn("Widget push failed", e);
+        lastWidgetJson = "";
     }
 }
 
-async function tick() {
-    const now = Date.now();
+function goOffline() {
+    if (wasInMatch) finishMatch();
+    if (wasRunning) {
+        pushActivity(null);
+        void pushWidget(null, labels().offline, false, { offline: true });
+    }
+    wasRunning = false;
+    wasInMatch = false;
+}
 
+async function tick(gen: number) {
+    const alive = () => gen === runId;
+    let processCheckedNow = false;
+
+    // Prozess-Check höchstens alle PROCESS_CHECK_MS — auch wenn das Spiel NICHT läuft
     let running = wasRunning;
-    if (!wasRunning || now - lastProcessCheck >= PROCESS_CHECK_MS) {
+    if (Date.now() - lastProcessCheck >= PROCESS_CHECK_MS) {
         running = await Native.isWarThunderRunning();
-        lastProcessCheck = now;
+        lastProcessCheck = Date.now();
+        processCheckedNow = true;
     }
-
-    if (running && wasRunning) {
-        const probe = await readJson("indicators");
-        if (probe === null) {
-            running = await Native.isWarThunderRunning();
-            lastProcessCheck = Date.now();
-        }
-    }
+    if (!alive()) return;
 
     if (!running) {
-        if (wasRunning) {
-            pushActivity(null);
-            await pushWidget(null, labels().offline, true);
-        }
-        wasRunning = false;
-        wasInMatch = false;
+        goOffline();
         return;
-    }
-
-    if (!wasRunning) {
-        wasRunning = true;
-        sessionStart = Date.now();
-        matchStart = Date.now();
-        lastMatch = null;
-        sessionKills = 0;
-        sessionDeaths = 0;
-        navalUnitId = "";
-        navalDetectedName = "";
     }
 
     const wantTelemetry = settings.store.showTelemetry;
@@ -500,60 +628,77 @@ async function tick() {
         readJson("map_info.json"),
         wantTelemetry ? readJson("state") : Promise.resolve(null),
     ]);
+    if (!alive()) return;
 
-    const inMatch = Boolean(mapInfo?.valid);
-    const trackKills = Boolean(settings.store.showKills && settings.store.playerName?.trim());
+    // API antwortet gar nicht mehr -> prüfen, ob das Spiel inzwischen zu ist
+    if (indicators === null && mapInfo === null && wasRunning && !processCheckedNow) {
+        running = await Native.isWarThunderRunning();
+        lastProcessCheck = Date.now();
+        if (!alive()) return;
+        if (!running) {
+            goOffline();
+            return;
+        }
+    }
 
-    if (inMatch && !wasInMatch) {
+    if (!wasRunning) {
+        wasRunning = true;
+        wasInMatch = false;
+        sessionStart = Date.now();
         matchStart = Date.now();
+        lastMatch = null;
+        sessionKills = 0;
+        sessionDeaths = 0;
         kills = 0;
         deaths = 0;
         navalUnitId = "";
         navalDetectedName = "";
-        if (trackKills) await baselineKillFeed();
-    } else if (!inMatch && wasInMatch && trackKills) {
-        lastMatch = { kills, deaths };
-        sessionKills += kills;
-        sessionDeaths += deaths;
     }
+
+    // null = Request fehlgeschlagen -> alten Zustand behalten, statt das Match zu beenden
+    const inMatch = mapInfo === null ? wasInMatch : Boolean(mapInfo.valid);
+    const trackKills = Boolean(settings.store.showKills && playerName());
+
+    if (inMatch && !wasInMatch) startMatch();
+    else if (!inMatch && wasInMatch) finishMatch();
     wasInMatch = inMatch;
 
     if (inMatch) await updateKillFeed();
+    if (!alive()) return;
 
     const rawType = String(indicators?.type ?? "").trim();
 
-    if (!rawType && indicators && Date.now() - lastEmptyTypeLog > 60_000) {
+    if (inMatch && !rawType && indicators && Date.now() - lastEmptyTypeLog > 60_000) {
         lastEmptyTypeLog = Date.now();
         logger.info("indicators ohne type-Feld:", indicators);
     }
 
-    const vehicle = await resolveVehicle(rawType || navalUnitId);
+    // Killfeed-Schiff nur im Match verwenden, sonst hängt das letzte Schiff im Hangar
+    const vehicle = resolveVehicle(unitIdFromType(rawType) || (inMatch ? navalUnitId : ""));
 
     const L = labels();
     let stateLine = inMatch ? L.inMatch : L.inHangar;
 
-    {
-        if (inMatch) {
-            if (trackKills) {
-                stateLine += ` · ⚔ ${kills}`;
-                if (deaths > 0) stateLine += ` ☠ ${deaths}`;
-            }
+    if (inMatch) {
+        if (trackKills) {
+            stateLine += ` · ⚔ ${kills}`;
+            if (deaths > 0) stateLine += ` ☠ ${deaths}`;
+        }
 
-            if (wantTelemetry) {
-                const tele = telemetryLine(state, indicators);
-                if (tele) stateLine += ` · ${tele}`;
-            }
-        } else if (trackKills) {
-            const mode = settings.store.showLastMatch;
-            if (mode === "last" && lastMatch) {
-                stateLine += ` · ${L.lastMatch} ⚔ ${lastMatch.kills} ☠ ${lastMatch.deaths}`;
-            } else if (mode === "session" && (sessionKills > 0 || sessionDeaths > 0)) {
-                stateLine += ` · ${L.session} ⚔ ${sessionKills} ☠ ${sessionDeaths}`;
-            }
+        if (wantTelemetry) {
+            const tele = telemetryLine(state, indicators);
+            if (tele) stateLine += ` · ${tele}`;
+        }
+    } else if (trackKills) {
+        const mode = settings.store.showLastMatch;
+        if (mode === "last" && lastMatch) {
+            stateLine += ` · ${L.lastMatch} ⚔ ${lastMatch.kills} ☠ ${lastMatch.deaths}`;
+        } else if (mode === "session" && (sessionKills > 0 || sessionDeaths > 0)) {
+            stateLine += ` · ${L.session} ⚔ ${sessionKills} ☠ ${sessionDeaths}`;
         }
     }
 
-    const logo = (await getLogoAsset()) ?? LARGE_FALLBACK;
+    const logo = await getLogoAsset();
     let largeImage = logo;
     let largeText = "War Thunder";
 
@@ -582,10 +727,11 @@ async function tick() {
         if (smallImage) smallText = vehicle.nation ?? vehicle.name;
     }
 
-    if (!smallImage && settings.store.smallImageMode !== "none" && largeImage !== logo) {
+    if (!smallImage && settings.store.smallImageMode !== "none" && logo && largeImage !== logo) {
         smallImage = logo;
         smallText = "War Thunder";
     }
+
     let timestamps: { start: number; } | undefined;
     switch (settings.store.timestampMode) {
         case "match":
@@ -602,7 +748,7 @@ async function tick() {
     const buttonUrls: string[] = [];
 
     if (settings.store.showWikiButton && vehicle?.wikiUrl) {
-        buttonLabels.push("Vehicle Wiki");
+        buttonLabels.push(L.wiki);
         buttonUrls.push(vehicle.wikiUrl);
     }
 
@@ -621,13 +767,9 @@ async function tick() {
 
     let details: string | undefined;
     if (vehicle) {
-        details = `${labels().using} ${vehicle.name}`;
-
-        const brMode = settings.store.brMode;
-        if (brMode !== "off" && vehicle.br) {
-            const br = vehicle.br[brMode as "ab" | "rb" | "sb"];
-            if (br) details += ` · BR ${br}`;
-        }
+        details = `${L.using} ${vehicle.name}`;
+        const br = brForMode(vehicle);
+        if (br) details += ` · BR ${br}`;
     }
 
     const activity: any = {
@@ -652,23 +794,43 @@ async function tick() {
         activity.metadata = { button_urls: buttonUrls };
     }
 
+    // Plugin wurde während der awaits gestoppt -> nichts mehr senden
+    if (!alive()) return;
     pushActivity(activity);
 
-    await pushWidget(vehicle, inMatch ? labels().inMatch : labels().inHangar);
+    if (settings.store.widgetEnabled) {
+        await pushWidget(vehicle, inMatch ? L.inMatch : L.inHangar, inMatch);
+    } else if (widgetOnline) {
+        await pushWidget(null, L.offline, false, { offline: true });
+    }
 }
 
-async function loop() {
-    if (stopped) return;
+async function loop(gen: number) {
+    if (gen !== runId) return;
 
     try {
-        await tick();
+        await tick(gen);
     } catch (e) {
         logger.error("tick failed", e);
     }
 
-    if (stopped) return;
+    if (gen !== runId) return;
     const seconds = Number(settings.store.updateInterval) || 2;
-    timer = setTimeout(loop, seconds * 1000);
+    timer = setTimeout(() => loop(gen), seconds * 1000);
+}
+
+async function migrateLegacyToken() {
+    const legacy = settings.store.widgetBotToken?.trim();
+    if (!legacy) return;
+
+    try {
+        if (await Native.setWidgetToken(legacy)) {
+            settings.store.widgetBotToken = "";
+            logger.info("Widget-Token aus den Einstellungen in die Token-Datei verschoben");
+        }
+    } catch (e) {
+        logger.warn("Token-Migration fehlgeschlagen", e);
+    }
 }
 
 export default definePlugin({
@@ -678,17 +840,23 @@ export default definePlugin({
     settings,
 
     start() {
-        stopped = false;
+        const gen = ++runId;
+        if (timer) clearTimeout(timer);
+        timer = null;
         wasRunning = false;
         wasInMatch = false;
         lastProcessCheck = 0;
-        loop();
+        lastActivityJson = "";
+        migrateLegacyToken().finally(() => loop(gen));
     },
 
     stop() {
-        stopped = true;
+        runId++;
         if (timer) clearTimeout(timer);
         timer = null;
+
+        void pushWidget(null, labels().offline, false, { offline: true });
+
         wasRunning = false;
         wasInMatch = false;
         lastActivityJson = "";

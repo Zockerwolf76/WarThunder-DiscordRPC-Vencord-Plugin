@@ -1,87 +1,146 @@
 # WarThunderRPC
 
-Simple Vencord userplugin that shows your current War Thunder vehicle in Discord Rich Presence.
+A Vencord userplugin that shows what you're playing in War Thunder as Discord Rich Presence: the vehicle you're in, its render image, BR, nation flag, live telemetry and a kill counter. It can also push your stats to a Discord profile widget.
+
+---
 
 ## Features
 
-- Shows `Using: <vehicle name>` in RPC
-- Uses War Thunder local API (`127.0.0.1:8111`)
-- Detects match state (`In Match` / `In Hangar`)
-- Optional name mode:
-  - Wiki name (default)
-  - Raw `/indicators.type`
+| | |
+|---|---|
+| **Presence** | `Using: <vehicle> · BR x.x`, match/hangar state, elapsed time |
+| **Images** | Vehicle render as the large image, nation flag as the small badge |
+| **Telemetry** | Live speed and altitude during a match |
+| **Kill counter** | Kills/deaths from the kill feed, last-match or session summary in the hangar |
+| **Naval support** | Detects your ship from the kill feed (the game API doesn't report ships) |
+| **Nation detection** | Operator nation parsed from the wiki, with 65 countries supported |
+| **Buttons** | Vehicle wiki page plus an optional custom button |
+| **Profile widget** | Live stats on your Discord profile (optional) |
+| **Languages** | English and German |
 
 ## Requirements
 
-- Vencord desktop build with userplugins enabled
-- War Thunder running with local telemetry available on `http://127.0.0.1:8111`
+- Vencord **built from source** (userplugins need a source build)
+- War Thunder running. The plugin reads the game's local API at `http://127.0.0.1:8111`
+- Windows or Linux
 
 ## Installation
 
-1. Download the latest release archive from the repo [Releases](https://github.com/Zockerwolf76/WarThunder-DiscordRPC-Vencord-Plugin/releases) tab.
-2. Extract it.
-3. Copy the `WarThunderRPC` folder to:
-   `src/userplugins`
-4. Rebuild Vencord.
-5. Enable the plugin in Vencord settings.
+1. Download the latest archive from [Releases](https://github.com/Zockerwolf76/WarThunder-DiscordRPC-Vencord-Plugin/releases).
+2. Extract it and copy the `WarThunderRPC` folder into `Vencord/src/userplugins/`.
+3. Rebuild Vencord:
+   ```bash
+   pnpm build
+   ```
+4. Fully restart Discord (quit it from the tray as well).
+5. Enable **WarThunderRPC** in *Settings → Vencord → Plugins*.
 
-## Notes
+**Updating:** replace the files in `src/userplugins/WarThunderRPC/`, run `pnpm build` again and restart Discord.
 
-- RPC is only shown while War Thunder is running.
-- If wiki lookup fails, the plugin falls back to `Unknown Vehicle` (or raw type if that mode is selected).
+## Settings
 
-# WarThunderRPC — Patch Notes V1.1
+| Section | Setting | What it does |
+|---|---|---|
+| Presence | Show telemetry | Speed and altitude in the state line |
+| | Battle Rating | RB / AB / SB / off |
+| | Elapsed time | Current match / whole session / off |
+| | Language | English / Deutsch |
+| Kill Counter | Player name | Your exact in-game nickname **without clan tag**. Required for the kill counter **and** ship detection |
+| | Show kills | Kills/deaths in the state line |
+| | Hangar summary | Last match / session totals / off |
+| Images | Vehicle image | Vehicle render instead of the War Thunder logo |
+| | Image style | *Fit* (whole vehicle visible) or *Fill* (cropped, larger) |
+| | Small badge | Nation flag / War Thunder logo / none |
+| Buttons | Wiki button | Link to the vehicle's wiki page |
+| | Button 2 | Custom label and URL. `{id}` and `{name}` get replaced |
+| Profile Widget | Enable, bot token | See below |
+| Advanced | Update interval | 1–10 seconds |
 
-## New: Ship Detection (Naval Battles)
+## Profile widget
 
-Naval battles are now supported — even though the War Thunder API
-(`localhost:8111/indicators`) simply returns `{valid: false}` for ships and never
-reveals the player's vehicle.
+Pushes live stats to a profile widget of the RPC application (at most every 15 s, and immediately when your status changes).
 
-- The player's ship is identified from the **kill feed** instead: as soon as your
-  nickname appears there (dealing or taking a hit), the ship name is extracted from
-  the parentheses.
-- The localized display name (German **and** English) is resolved back into a unit ID
-  via the WT datamine localization table (~5.8 MB CSV, cached on disk for 7 days) —
-  after that, render, BR, flag and vehicle type work as usual.
-- Naval **long names** ("Fletcher-class, USS Bennion (DD-662), 1944") with nested
-  parentheses are now recognized correctly (3,872 additional name variants in the
-  lookup table, regex fix for nested parentheses).
-- Requirement: nickname set in the plugin settings. The ship appears from your first
-  kill feed mention in the match.
+The **bot token** is entered in the plugin settings, but it is **stored in a separate local file** in Discord's data folder, not in your Vencord settings. This keeps it out of settings exports and cloud sync. Tokens from older versions are moved there automatically.
 
-## Reworked: Nation & Flag Detection
+<details>
+<summary>Available widget fields</summary>
 
-The operator nation now comes from the **authoritative source** — the wiki unit page:
+| Field | Type | Content |
+|---|---|---|
+| `status` | text | In Match / In Hangar / Offline |
+| `vehicle` | text | Vehicle name |
+| `nation` | text | Operator nation |
+| `vehicle_type` | text | e.g. Medium Tank, Fighter |
+| `br` | text | BR for the selected mode |
+| `br_line` | text | `BR x.x · Nation` |
+| `match_kills`, `match_deaths` | number | Current match (last match while in hangar) |
+| `match_kd` | text | K/D of that match |
+| `session_kills`, `session_deaths` | number | Whole session, including the running match |
+| `session_kd` | text | Session K/D |
+| `stats_line` | text | `⚔ kills ☠ deaths · K/D x.xx` |
+| `kills`, `deaths`, `kd` | | Aliases of `match_kills`, `match_deaths` and `session_kd` |
+| `vehicle_image` | image | Transparent vehicle render |
+| `vehicle_art` | image | Wiki social artwork with background, for hero layouts |
+| `flag_image` | image | Nation flag |
 
-- **Wiki operator parser**: The header flag and the "Operator" infobox of the unit
-  page are parsed directly from the HTML. This fixes all previously wrong cases:
-  Shenyang F-5 → **North Korea**, F-14A IRIAF → **Iran**, Su-30MK2V → **Venezuela**,
-  JF-17 / A-5C → **Pakistan**, and so on.
-- **Fallback chain** (if the wiki does not respond): manual overrides →
-  ID suffixes including air force abbreviations (`_iriaf`, `_iaf`, `_idf`, `_raaf`,
-  `_rocaf`, 244 export units) → country in the name's parentheses → tree nation
-  from the datamine.
-- **Flags from Gaijin's CDN**: Flag images now come uniformly from
-  `static.encyclopedia.warthunder.com/unit_tooltip/` — for **all** nations including
-  USSR, GDR, German Empire, etc. The broken Wikimedia link (USSR) is gone for good,
-  and newly added nations work automatically.
-- Country database extended to **65 nations** (all operator countries of the wiki).
+</details>
 
-## Profile Widget
+## How it works
 
-- **Update interval lowered from 60 s to 15 s** — kills/deaths show up much faster.
-- New field **`match_kd`** (K/D of the current match only) for the second stats row.
-- New field **`vehicle_art`** (social artwork with background) as an alternative to
-  the transparent render — intended for hero layouts.
-- New **alias fields** `session_kd`, `match_kills`, `match_deaths` — field names in
-  the widget editor and the plugin now match in both naming schemes.
+- **Vehicle:** read from `/indicators` and resolved through the War Thunder wiki (name, render, operator) and the datamine (BR, type, tree nation).
+- **Ships:** `/indicators` returns nothing for ships, so the plugin picks up your ship name from the kill feed as soon as you appear in it, and maps it back to a unit ID.
+- **Caching:** datamine files are cached on disk for 7 days. If the wiki is unreachable, name, BR and nation still come from the datamine.
 
-## Settings Page Rework
+## Troubleshooting
 
-- Completely restructured with **visual section headers**:
-  Presence · Kill Counter · Images · Buttons · Profile Widget · Advanced
-- **Removed** (unnecessary): "In Match/In Hangar" toggle (now always on),
-  raw name source (`/indicators` mode), separate widget app ID (uses the RPC app).
-- Descriptions shortened and cleaned up; existing settings are preserved.
+| Problem | Fix |
+|---|---|
+| No presence at all | Is War Thunder running? Check that `http://127.0.0.1:8111` opens in a browser while you're in game |
+| Kill counter stays at 0 | Player name must match exactly, without clan tag |
+| Ship not shown | It only appears after your first kill-feed mention in a match |
+| Old or wrong image | Fully restart Discord, since images are cached per session |
 
+---
+
+## Changelog
+
+### V1.2: Bugfixes & robustness
+
+**Fixes**
+- A single slow API response no longer ends the match. Kill counter and match timer stay intact.
+- Disabling the plugin no longer brings the presence back, and quick off/on no longer starts two update loops.
+- While the game is closed, the process check runs every 10 s instead of every 2 s.
+- The last ship no longer stays in the presence after returning to the hangar.
+- Ship detection now works even if *Show kills* is off.
+- Own-vehicle detection no longer matches other players whose names contain yours (e.g. `Wolf` vs `BigWolf`).
+- Special characters in vehicle names (`&quot;`, `&amp;` …) are decoded correctly.
+- The fallback logo is now a valid image.
+- The vehicle render is read directly from the wiki page. Unit IDs with capital letters now get the right image too.
+- All flags, including the fallback path, come from Gaijin's CDN.
+- Deaths without a killer ("wrecked") are now counted.
+- Enabling the kill counter mid-match no longer counts old kill-feed entries.
+
+**Improvements**
+- Wiki and datamine lookups run in the background. Presence updates never stall on downloads.
+- If the wiki is unreachable, the vehicle is still shown (name from the datamine) and the wiki is retried after 5 min.
+- Requests send a User-Agent, so the wiki no longer blocks them.
+- **Linux support** (process detection via `pgrep`).
+- Altitude format and wiki button label follow the language setting.
+
+**Profile widget**
+- **Bot token moved out of settings.json** into its own local file. Existing tokens are migrated automatically.
+- Status changes (match ↔ hangar ↔ offline) are pushed immediately.
+- The widget switches to *Offline* when the plugin or widget is disabled.
+- Session stats include the running match. Match stats show the last match while in the hangar.
+
+### V1.1: Ships, nations & widget
+
+- **Naval battles:** ship detection via the kill feed, including long names with nested parentheses. The name is resolved through the datamine localization table (EN + DE).
+- **Nation detection reworked:** operator parsed from the wiki page (fixes e.g. Shenyang F-5 → North Korea, F-14A IRIAF → Iran, JF-17 → Pakistan). Fallbacks: overrides → ID suffixes (`_iriaf`, `_iaf`, `_raaf` …) → name → tree nation. 65 countries.
+- **Flags** from Gaijin's CDN.
+- **Widget:** 15 s interval (was 60 s), new fields `match_kd`, `vehicle_art`, aliases `session_kd`, `match_kills`, `match_deaths`.
+- **Settings page** restructured with section headers. Removed the match-state toggle, the raw name mode and the separate widget app ID.
+
+### V1.0
+
+- Initial release: vehicle name in Rich Presence, match/hangar state.
